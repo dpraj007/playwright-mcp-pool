@@ -250,7 +250,16 @@ Paste into `CLAUDE.md`, or any agent's instructions:
 - Headed mode means up to `MAX` visible windows, and is marginally more
   detectable than headless on anti-bot sites. Sites with aggressive bot
   detection are usually better handled on the headed `playwright` instance.
-- `state.json` is your cookie jar. It is gitignored here; keep it that way.
+- `state.json` is your cookie jar. It is gitignored here (as is any file
+  matching `*state.json`, since `EXPORT_OUT` can rename it); keep it that way.
+- The pool re-exports every upstream tool, and does not restrict
+  `browser_run_code_unsafe` - upstream's own description calls it
+  "RCE-equivalent". Any agent holding a session can run arbitrary code in the
+  Playwright server process. That is upstream's design, not something the pool
+  adds, but worth knowing before pointing an autonomous agent at it.
+- Backends resolve `@playwright/mcp@latest` on every spawn, so a new upstream
+  release lands without warning in a process holding your cookies. For anything
+  long-running, pin it: `BROWSERPOOL_PACKAGE=@playwright/mcp@0.0.41`.
 
 ## Layout
 

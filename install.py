@@ -117,8 +117,14 @@ def main():
     path = args.config
     cfg = {}
     if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            cfg = json.load(f)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except ValueError as e:
+            print("ERROR: %s is not valid JSON (%s).\n"
+                  "Fix or move it, then re-run. Nothing was written."
+                  % (path, e), file=sys.stderr)
+            sys.exit(1)
         backup = "%s.bak.%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
         shutil.copyfile(path, backup)
         print("backed up -> %s" % backup)

@@ -16,3 +16,7 @@ venv/
 # Browser profiles, if anyone clones one in-tree
 *-profile/
 *-profile-*/
+
+# Any storage-state seed, whatever it is named (EXPORT_OUT can rename it)
+*state.json
+state*.json

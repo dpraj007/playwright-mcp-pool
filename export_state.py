@@ -72,8 +72,10 @@ def main():
         sys.exit(1)
 
     before = old_cookie_count()
+    made_backup = False
     if os.path.exists(OUT):
         shutil.copyfile(OUT, OUT + ".bak")
+        made_backup = True
         print("backed up previous -> %s.bak (%s cookies)" % (OUT, before))
 
     try:
@@ -100,8 +102,10 @@ def main():
                   file=sys.stderr)
         else:
             print("ERROR exporting: %s" % e, file=sys.stderr)
-        # never leave a half-written seed behind
-        if os.path.exists(OUT + ".bak"):
+        # Never leave a half-written seed behind - but only restore the backup
+        # this run made, or a stale one from an earlier run gets promoted back
+        # into place and silently presented as current.
+        if made_backup and os.path.exists(OUT + ".bak"):
             shutil.copyfile(OUT + ".bak", OUT)
             print("restored previous state.json from backup", file=sys.stderr)
         sys.exit(1)

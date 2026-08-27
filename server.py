@@ -37,6 +37,7 @@ import atexit
 import itertools
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -45,7 +46,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROTO = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -67,7 +68,8 @@ FALLBACK_SCREEN = (1920, 1080)
 def _parse_wh(raw):
     try:
         w, h = str(raw).lower().split("x")
-        return int(w), int(h)
+        w, h = int(w), int(h)
+        return (w, h) if w > 0 and h > 0 else None
     except Exception:
         return None
 
@@ -173,7 +175,8 @@ def layout():
                 rows = -(-MAX // cols)
                 w, h = sw // cols, sh // rows
             except ValueError:
-                pass
+                log("ignoring BROWSERPOOL_TILE_COLS=%r (not an integer)"
+                    % COLS_OVERRIDE)
         if SIZE_OVERRIDE:
             w, h = SIZE_OVERRIDE
         _LAYOUT = (cols, w, h)
@@ -210,6 +213,11 @@ def tiled_config(slot):
         cols, win_w, win_h = _layout_cache
         x = (slot % cols) * win_w
         y = (slot // cols) * win_h
+        sw, sh = screen_size()
+        if y + win_h > sh:            # more windows than the grid holds: overlap
+            y = ((slot // cols) * win_h) % max(1, sh - win_h + 1)
+        if x + win_w > sw:
+            x = ((slot % cols) * win_w) % max(1, sw - win_w + 1)
         args += ["--window-position=%d,%d" % (x, y),
                  "--window-size=%d,%d" % (win_w, win_h)]
         launch["args"] = args
@@ -244,15 +252,41 @@ class Backend:
         self.window_state = "foreground" if not HEADLESS else "headless"
         self.lock = threading.Lock()
         self.last_used = time.time()
+        self.dead = False
         self._id = itertools.count(1)
+        self._inbox = queue.Queue()
         self.p = subprocess.Popen(
             backend_args(slot), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-            bufsize=1, shell=USE_SHELL)
-        self._rpc("initialize", {"protocolVersion": PROTO, "capabilities": {},
-                                 "clientInfo": {"name": "browserpool",
-                                                "version": VERSION}})
-        self._notify("notifications/initialized")
+            errors="replace", bufsize=1, shell=USE_SHELL)
+        # A dedicated reader keeps _rpc off a blocking readline(), which is what
+        # makes its timeout real rather than advisory.
+        threading.Thread(target=self._pump, daemon=True).start()
+        try:
+            self._rpc("initialize", {"protocolVersion": PROTO, "capabilities": {},
+                                     "clientInfo": {"name": "browserpool",
+                                                    "version": VERSION}})
+            self._notify("notifications/initialized")
+        except Exception:
+            self.kill()          # never leak the child on a failed handshake
+            raise
+
+    def _pump(self):
+        """Read the backend's stdout forever; queue every parsed message."""
+        try:
+            for line in self.p.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self._inbox.put(json.loads(line))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        finally:
+            self.dead = True
+            self._inbox.put(None)     # sentinel: the stream is gone
 
     def _send(self, obj):
         self.p.stdin.write(json.dumps(obj) + "\n")
@@ -271,20 +305,34 @@ class Backend:
             m["params"] = params
         self._send(m)
         end = time.time() + timeout
-        while time.time() < end:
-            line = self.p.stdout.readline()
-            if not line:
-                raise RuntimeError("backend closed")
-            line = line.strip()
-            if not line:
-                continue
+        while True:
+            remaining = end - time.time()
+            if remaining <= 0:
+                # A wedged backend is not worth keeping: kill it so the session
+                # fails loudly instead of holding its lock for good. Reap in the
+                # background - the caller should not also wait out teardown's
+                # escalation while still holding this backend's lock.
+                self.dead = True
+                threading.Thread(target=self.kill, daemon=True).start()
+                raise TimeoutError("backend %s timed out after %ds"
+                                   % (method, timeout))
             try:
-                obj = json.loads(line)
-            except Exception:
+                obj = self._inbox.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if obj is None:
+                raise RuntimeError("backend closed")
+            # A message carrying "method" is a request/notification FROM the
+            # backend, not our answer - its id lives in a different space and
+            # would otherwise be mistaken for the response.
+            if "method" in obj:
+                if obj.get("id") is not None:
+                    self._send({"jsonrpc": "2.0", "id": obj["id"],
+                                "error": {"code": -32601,
+                                          "message": "browserpool does not serve backend requests"}})
                 continue
             if obj.get("id") == mid:
                 return obj
-        raise TimeoutError("backend " + method + " timed out after %ds" % timeout)
 
     def call_tool(self, name, args, timeout=180):
         with self.lock:
@@ -304,12 +352,46 @@ class Backend:
         return time.time() - self.last_used
 
     def close(self):
+        # Bounded: never block teardown on a backend that has stopped answering.
+        if not self.dead and self.lock.acquire(timeout=5):
+            try:
+                self._rpc("tools/call",
+                          {"name": "browser_close", "arguments": {}}, timeout=20)
+            except Exception:
+                pass
+            finally:
+                self.lock.release()
+        self.kill()
+
+    def kill(self):
+        """Deterministic teardown. Closing stdin is what actually stops the
+        backend: with shell=True the tracked child is the cmd.exe wrapper, so
+        terminate() alone leaves node running until the pipe happens to close.
+        """
+        self.dead = True
         try:
-            self.call_tool("browser_close", {}, timeout=20)
+            if self.p.stdin and not self.p.stdin.closed:
+                self.p.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.p.wait(timeout=5)
+            return
         except Exception:
             pass
         try:
             self.p.terminate()
+            self.p.wait(timeout=5)
+            return
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(self.p.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                self.p.kill()
+            self.p.wait(timeout=5)      # reap, so POSIX leaves no zombie
         except Exception:
             pass
 
@@ -334,19 +416,27 @@ class Pool:
         if self.backend_tools is None:
             tmpl = Backend("schema")
             try:
-                self.backend_tools = tmpl.list_tools()
+                tools = tmpl.list_tools()
+                if not tools:
+                    raise RuntimeError(
+                        "backend returned no tools; not caching an empty "
+                        "catalog - check that npx can fetch " + PACKAGE)
+                self.backend_tools = tools
                 if TILE and not HEADLESS and not SCREEN_OVERRIDE:
                     try:
                         tmpl.call_tool("browser_navigate", {"url": "about:blank"},
                                        timeout=60)
                         r = tmpl.call_tool(
                             "browser_evaluate",
-                            {"function": "() => screen.availWidth + 'x' + screen.availHeight"},
+                            {"function": "() => 'BPSCREEN=' + screen.availWidth "
+                                         "+ 'x' + screen.availHeight"},
                             timeout=60)
                         txt = json.dumps(r.get("result", {}))
-                        m = re.search(r"(\d{3,5})\s*x\s*(\d{3,5})", txt)
+                        m = re.search(r"BPSCREEN=(\d{3,5})x(\d{3,5})", txt)
                         if m:
                             _MEASURED_SCREEN = (int(m.group(1)), int(m.group(2)))
+                            with _TILE_LOCK:
+                                globals()["_LAYOUT"] = None   # recompute on real numbers
                             log("measured screen: %dx%d" % _MEASURED_SCREEN)
                     except Exception as e:
                         log("screen measurement failed (%s); falling back" % e)
@@ -521,6 +611,17 @@ def text_result(s, is_error=False):
     return {"content": [{"type": "text", "text": s}], "isError": is_error}
 
 
+def _evict_or_error(sid, be, exc):
+    """A backend that died or wedged is released, so its slot returns to the
+    pool instead of counting against MAX with no live browser behind it."""
+    if getattr(be, "dead", False):
+        POOL.close_session(sid)
+        return text_result(
+            "error: session %s died (%s) and has been released; call "
+            "browser_new_session for a fresh one" % (sid, exc), True)
+    return text_result("error: %s" % exc, True)
+
+
 def handle_call(name, args):
     if name == "browser_new_session":
         sid = POOL.new_session()
@@ -548,14 +649,22 @@ def handle_call(name, args):
         except KeyError:
             return text_result("error: unknown session %s; call browser_new_session"
                                % sid, True)
-        resp = be.call_tool(
-            "browser_run_code_unsafe",
-            {"code": BRING_TO_FRONT_JS if to_front else SEND_TO_BACK_JS},
-            timeout=60)
-        if "error" in resp:
+        try:
+            resp = be.call_tool(
+                "browser_run_code_unsafe",
+                {"code": BRING_TO_FRONT_JS if to_front else SEND_TO_BACK_JS},
+                timeout=60)
+        except Exception as e:
+            return _evict_or_error(sid, be, e)
+        # Upstream reports most failures as a RESULT carrying isError, not as a
+        # JSON-RPC error, so checking only the latter would claim a success that
+        # never happened and leave window_state lying.
+        failed = resp.get("result", {})
+        if "error" in resp or (isinstance(failed, dict) and failed.get("isError")):
+            detail = json.dumps(resp.get("error") or failed)[:300]
             return text_result(
-                "%s failed (needs the backend's run-code capability): %s"
-                % (name, json.dumps(resp["error"])), True)
+                "%s failed (the backend's run-code capability may be disabled): %s"
+                % (name, detail), True)
         be.window_state = "foreground" if to_front else "background"
         return text_result(
             "session %s is now in the %s (slot %s). The tab is unchanged and "
@@ -572,7 +681,10 @@ def handle_call(name, args):
     except KeyError:
         return text_result(
             "error: unknown session %s; call browser_new_session" % sid, True)
-    resp = be.call_tool(name, args)
+    try:
+        resp = be.call_tool(name, args)
+    except Exception as e:
+        return _evict_or_error(sid, be, e)
     if "error" in resp:
         return text_result("backend error: " + json.dumps(resp["error"]), True)
     return resp.get("result", text_result("(no result)"))
@@ -595,6 +707,8 @@ def reply(mid, result=None, error=None):
 
 def worker(req):
     mid = req.get("id")
+    if mid is None:
+        return                       # notification: a reply would be a protocol error
     params = req.get("params") or {}
     try:
         reply(mid, handle_call(params.get("name"),
