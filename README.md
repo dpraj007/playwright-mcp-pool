@@ -153,6 +153,7 @@ default.
 | `BROWSERPOOL_TILE_COLS` | fit to screen | tiled windows per row |
 | `BROWSERPOOL_WINDOW_SIZE` | fit to screen | tiled window size, `WxH` |
 | `BROWSERPOOL_SCREEN` | measured | screen size to fit into, `WxH` |
+| `BROWSERPOOL_FOREGROUND` | `1` | raise each new headed window; `0` leaves placement alone |
 
 Env changes take effect when the client restarts the server - a running pool
 keeps the environment it started with.
@@ -208,11 +209,17 @@ screen. `BROWSERPOOL_SCREEN=WxH` overrides the measurement.
 
 ### Moving one session between background and foreground
 
-The same tab, without reloading it or losing any state:
+In headed mode a new session **starts in the foreground**: `browser_new_session`
+raises its window, so a human sees work begin without the agent having to ask.
+That costs about 0.8s at allocation because the browser launches eagerly rather
+than on first navigate - which the first navigate then gets back. Set
+`BROWSERPOOL_FOREGROUND=0` to leave placement to the window manager.
+
+From there the same tab moves either way, without reloading or losing state:
 
 ```
-browser_bring_to_front(session="s3")   # restore + raise + focus, for a human
-browser_send_to_back(session="s3")     # minimise it again, tab keeps running
+browser_send_to_back(session="s3")     # minimise it, tab keeps running
+browser_bring_to_front(session="s3")   # restore + raise + focus again
 ```
 
 Upstream has neither tool. `bring_to_front` reaches `page.bringToFront()` and
@@ -226,9 +233,11 @@ alone does not un-minimise. Both report a no-op when the pool is headless, and
 
 Paste into `CLAUDE.md`, or any agent's instructions:
 
-> Browser work runs in the **background** by default - you do not need a visible
-> window to read or drive a page. Allocate with `browser_new_session`, then pass
-> `session="sN"` to every `browser_*` call. Read the page with `browser_snapshot`
+> Allocate with `browser_new_session`, then pass `session="sN"` to every
+> `browser_*` call. In headed mode the new window comes up in the foreground so
+> the human can see work start; call `browser_send_to_back(session)` right away
+> if the task should run unobtrusively. You never need a visible window to read
+> or drive a page. Read the page with `browser_snapshot`
 > (the only view whose refs `browser_click` can use) or `browser_evaluate`, and
 > use `browser_take_screenshot` to look at pixels. All of this works identically
 > whether the pool is headless or headed.

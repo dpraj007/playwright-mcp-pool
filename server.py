@@ -32,6 +32,7 @@ Config via env:
   BROWSERPOOL_TILE_COLS     tiled windows per row     (default: fit to screen)
   BROWSERPOOL_WINDOW_SIZE   tiled window size, WxH    (default: fit to screen)
   BROWSERPOOL_SCREEN        screen size to fit into, WxH  (default: measured)
+  BROWSERPOOL_FOREGROUND    "0" stops new headed sessions being raised (default 1)
 """
 import atexit
 import itertools
@@ -46,7 +47,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 PROTO = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -58,6 +59,9 @@ HEADLESS = os.environ.get("BROWSERPOOL_HEADLESS", "1") != "0"
 IDLE_TIMEOUT = int(os.environ.get("BROWSERPOOL_IDLE_TIMEOUT", "3600"))
 PACKAGE = os.environ.get("BROWSERPOOL_PACKAGE", "@playwright/mcp@latest")
 TILE = os.environ.get("BROWSERPOOL_TILE", "1") != "0"
+# New headed sessions are raised on allocation, so a human sees work start
+# without the agent having to ask. "0" leaves placement to the window manager.
+FOREGROUND_DEFAULT = os.environ.get("BROWSERPOOL_FOREGROUND", "1") != "0"
 # npx is a .cmd shim on Windows and only resolves through the shell there.
 USE_SHELL = os.name == "nt"
 
@@ -249,7 +253,10 @@ class Backend:
     def __init__(self, sid, slot=None):
         self.sid = sid
         self.slot = slot
-        self.window_state = "foreground" if not HEADLESS else "headless"
+        # Only claim "foreground" once something has actually raised it.
+        self.window_state = ("headless" if HEADLESS
+                             else "foreground" if FOREGROUND_DEFAULT
+                             else "unmanaged")
         self.lock = threading.Lock()
         self.last_used = time.time()
         self.dead = False
@@ -520,6 +527,7 @@ class Pool:
                     "free": MAX - len(self.sessions),
                     "headless": HEADLESS,
                     "tiling": TILE and not HEADLESS,
+                    "foreground_default": FOREGROUND_DEFAULT and not HEADLESS,
                     "grid": "%dx%d of %dx%d" % (layout()[0], -(-MAX // layout()[0]),
                                                 layout()[1], layout()[2])
                             if (TILE and not HEADLESS) else None,
@@ -611,6 +619,22 @@ def text_result(s, is_error=False):
     return {"content": [{"type": "text", "text": s}], "isError": is_error}
 
 
+def _set_window(be, to_front):
+    """Raise or hide one backend's window. Returns None on success, else why not."""
+    try:
+        resp = be.call_tool(
+            "browser_run_code_unsafe",
+            {"code": BRING_TO_FRONT_JS if to_front else SEND_TO_BACK_JS},
+            timeout=60)
+    except Exception as e:
+        return str(e)
+    result = resp.get("result", {})
+    if "error" in resp or (isinstance(result, dict) and result.get("isError")):
+        return json.dumps(resp.get("error") or result)[:300]
+    be.window_state = "foreground" if to_front else "background"
+    return None
+
+
 def _evict_or_error(sid, be, exc):
     """A backend that died or wedged is released, so its slot returns to the
     pool instead of counting against MAX with no live browser behind it."""
@@ -625,10 +649,19 @@ def _evict_or_error(sid, be, exc):
 def handle_call(name, args):
     if name == "browser_new_session":
         sid = POOL.new_session()
+        note = ""
+        if FOREGROUND_DEFAULT and not HEADLESS:
+            # Best-effort: a window that will not raise is not worth failing
+            # the session over, but say so rather than claiming it is up front.
+            why = _set_window(POOL.get(sid), True)
+            note = (" Window is in the FOREGROUND - call browser_send_to_back to "
+                    "work without covering the human's screen."
+                    if why is None else
+                    " (could not raise its window: %s)" % why)
         return text_result(
-            "session=%s ready (isolated, headless=%s, login seed=%s). Pass "
+            "session=%s ready (isolated, headless=%s, login seed=%s).%s Pass "
             'session="%s" to browser_* calls; close with browser_close_session.'
-            % (sid, HEADLESS, "yes" if os.path.exists(STATE) else "none", sid))
+            % (sid, HEADLESS, "yes" if os.path.exists(STATE) else "none", note, sid))
     if name == "browser_close_session":
         ok = POOL.close_session(args.get("session", ""))
         return text_result("closed" if ok else "no such session")
@@ -649,23 +682,13 @@ def handle_call(name, args):
         except KeyError:
             return text_result("error: unknown session %s; call browser_new_session"
                                % sid, True)
-        try:
-            resp = be.call_tool(
-                "browser_run_code_unsafe",
-                {"code": BRING_TO_FRONT_JS if to_front else SEND_TO_BACK_JS},
-                timeout=60)
-        except Exception as e:
-            return _evict_or_error(sid, be, e)
-        # Upstream reports most failures as a RESULT carrying isError, not as a
-        # JSON-RPC error, so checking only the latter would claim a success that
-        # never happened and leave window_state lying.
-        failed = resp.get("result", {})
-        if "error" in resp or (isinstance(failed, dict) and failed.get("isError")):
-            detail = json.dumps(resp.get("error") or failed)[:300]
+        why = _set_window(be, to_front)
+        if why is not None:
+            if getattr(be, "dead", False):
+                return _evict_or_error(sid, be, why)
             return text_result(
                 "%s failed (the backend's run-code capability may be disabled): %s"
-                % (name, detail), True)
-        be.window_state = "foreground" if to_front else "background"
+                % (name, why), True)
         return text_result(
             "session %s is now in the %s (slot %s). The tab is unchanged and "
             "still driveable." % (be.sid, be.window_state,
