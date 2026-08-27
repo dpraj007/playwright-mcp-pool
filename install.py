@@ -47,6 +47,8 @@ def build_servers(args):
         env["BROWSERPOOL_WINDOW_SIZE"] = args.window_size
     if args.tile_cols:
         env["BROWSERPOOL_TILE_COLS"] = str(args.tile_cols)
+    if args.screen:
+        env["BROWSERPOOL_SCREEN"] = args.screen
 
     servers = {
         "browserpool": {
@@ -87,9 +89,12 @@ def main():
     ap.add_argument("--headed", action="store_true",
                     help="pool browsers visible instead of headless")
     ap.add_argument("--window-size", default=None, metavar="WxH",
-                    help="tiled window size for headed pools (default 900x700)")
+                    help="tiled window size; default fits the screen")
     ap.add_argument("--tile-cols", type=int, default=None,
-                    help="tiled windows per row for headed pools (default 3)")
+                    help="tiled windows per row; default fits the screen")
+    ap.add_argument("--screen", default=None, metavar="WxH",
+                    help="screen size to fit the grid into; default is measured "
+                         "from a real browser at startup")
     ap.add_argument("--no-tile", action="store_true",
                     help="stack headed windows instead of tiling them")
     ap.add_argument("--no-fanout", action="store_true",

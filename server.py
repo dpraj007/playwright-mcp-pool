@@ -29,13 +29,15 @@ Config via env:
                             0 disables                           (default 3600)
   BROWSERPOOL_PACKAGE       backend spec   (default @playwright/mcp@latest)
   BROWSERPOOL_TILE          "0" disables window tiling in headed mode (default 1)
-  BROWSERPOOL_TILE_COLS     tiled windows per row                 (default 3)
-  BROWSERPOOL_WINDOW_SIZE   tiled window size, WxH          (default 900x700)
+  BROWSERPOOL_TILE_COLS     tiled windows per row     (default: fit to screen)
+  BROWSERPOOL_WINDOW_SIZE   tiled window size, WxH    (default: fit to screen)
+  BROWSERPOOL_SCREEN        screen size to fit into, WxH  (default: measured)
 """
 import atexit
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,7 +45,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROTO = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -55,25 +57,30 @@ HEADLESS = os.environ.get("BROWSERPOOL_HEADLESS", "1") != "0"
 IDLE_TIMEOUT = int(os.environ.get("BROWSERPOOL_IDLE_TIMEOUT", "3600"))
 PACKAGE = os.environ.get("BROWSERPOOL_PACKAGE", "@playwright/mcp@latest")
 TILE = os.environ.get("BROWSERPOOL_TILE", "1") != "0"
-TILE_COLS = max(1, int(os.environ.get("BROWSERPOOL_TILE_COLS", "3")))
 # npx is a .cmd shim on Windows and only resolves through the shell there.
 USE_SHELL = os.name == "nt"
 
+MIN_W, MIN_H = 480, 360
+FALLBACK_SCREEN = (1920, 1080)
 
-def _window_size():
-    raw = os.environ.get("BROWSERPOOL_WINDOW_SIZE", "900x700").lower()
+
+def _parse_wh(raw):
     try:
-        w, h = raw.split("x")
+        w, h = str(raw).lower().split("x")
         return int(w), int(h)
     except Exception:
-        return 900, 700
+        return None
 
 
-WIN_W, WIN_H = _window_size()
+COLS_OVERRIDE = os.environ.get("BROWSERPOOL_TILE_COLS")
+SIZE_OVERRIDE = _parse_wh(os.environ.get("BROWSERPOOL_WINDOW_SIZE", ""))
+SCREEN_OVERRIDE = _parse_wh(os.environ.get("BROWSERPOOL_SCREEN", ""))
 
 _TMPDIR = None
 _TILE_CONFIGS = {}
 _TILE_LOCK = threading.Lock()
+_MEASURED_SCREEN = None     # filled in from a real browser at schema boot
+_LAYOUT = None              # (cols, win_w, win_h), computed once
 
 
 def log(*a):
@@ -88,6 +95,94 @@ def _cleanup_tmp():
 atexit.register(_cleanup_tmp)
 
 
+def os_screen():
+    """Last-resort screen size. Deliberately distrusted: on a scaled Windows
+    desktop this process is DPI-virtualized and reports the logical size (e.g.
+    1280x800) while Chromium, launched with --force-device-scale-factor=1,
+    positions windows in physical pixels (2560x1600). Only used when a real
+    browser measurement is unavailable."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            try:
+                ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+            except Exception:
+                pass
+            u = ctypes.windll.user32
+            w, h = u.GetSystemMetrics(0), u.GetSystemMetrics(1)
+            if w > 0 and h > 0:
+                return w, h
+        else:
+            import tkinter
+            root = tkinter.Tk()
+            w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+            root.destroy()
+            if w > 0 and h > 0:
+                return w, int(h * 0.95)   # leave room for a menu bar / panel
+    except Exception:
+        pass
+    return None
+
+
+def screen_size():
+    if SCREEN_OVERRIDE:
+        return SCREEN_OVERRIDE
+    if _MEASURED_SCREEN:
+        return _MEASURED_SCREEN
+    return os_screen() or FALLBACK_SCREEN
+
+
+def choose_grid(n, sw, sh):
+    """Pick the column count that fills the screen best for n windows.
+
+    Scored by usable area, penalised for extreme aspect ratios - otherwise
+    "5 columns of 512x1504 slivers" wins on raw area and is useless to look at.
+    """
+    target_ar = 1.45
+    best = None
+    for cols in range(1, n + 1):
+        rows = -(-n // cols)
+        w, h = sw // cols, sh // rows
+        if w < MIN_W or h < MIN_H:
+            continue
+        ar = float(w) / float(h)
+        penalty = min(ar, target_ar) / max(ar, target_ar)
+        score = w * h * penalty
+        if best is None or score > best[0]:
+            best = (score, cols, w, h)
+    if best:
+        return best[1], best[2], best[3]
+    # Too many windows for the screen at a usable size: pack at the minimum
+    # and let them overlap rather than shrinking into unreadable slivers.
+    cols = max(1, min(n, sw // MIN_W))
+    rows = max(1, -(-n // cols))
+    return cols, max(MIN_W, sw // cols), max(MIN_H, sh // rows)
+
+
+def layout():
+    """(cols, window_w, window_h), computed once. Explicit env wins over fit."""
+    global _LAYOUT
+    with _TILE_LOCK:
+        if _LAYOUT is not None:
+            return _LAYOUT
+        sw, sh = screen_size()
+        cols, w, h = choose_grid(MAX, sw, sh)
+        if COLS_OVERRIDE:
+            try:
+                cols = max(1, int(COLS_OVERRIDE))
+                rows = -(-MAX // cols)
+                w, h = sw // cols, sh // rows
+            except ValueError:
+                pass
+        if SIZE_OVERRIDE:
+            w, h = SIZE_OVERRIDE
+        _LAYOUT = (cols, w, h)
+        log("tiling %d windows as %dx%d grid of %dx%d in a %dx%d screen%s"
+            % (MAX, cols, -(-MAX // cols), w, h, sw, sh,
+               " (measured)" if _MEASURED_SCREEN else ""))
+        return _LAYOUT
+
+
 def tiled_config(slot):
     """A per-slot copy of the base config that positions the window.
 
@@ -97,6 +192,7 @@ def tiled_config(slot):
     grid, so a headed pool tiles rather than stacks.
     """
     global _TMPDIR
+    _layout_cache = layout()          # must not be called while holding the lock
     with _TILE_LOCK:
         if slot in _TILE_CONFIGS:
             return _TILE_CONFIGS[slot]
@@ -111,10 +207,11 @@ def tiled_config(slot):
         launch = browser.setdefault("launchOptions", {})
         args = [a for a in launch.get("args", [])
                 if not a.startswith(("--window-position", "--window-size"))]
-        x = (slot % TILE_COLS) * WIN_W
-        y = (slot // TILE_COLS) * WIN_H
+        cols, win_w, win_h = _layout_cache
+        x = (slot % cols) * win_w
+        y = (slot // cols) * win_h
         args += ["--window-position=%d,%d" % (x, y),
-                 "--window-size=%d,%d" % (WIN_W, WIN_H)]
+                 "--window-size=%d,%d" % (win_w, win_h)]
         launch["args"] = args
         if _TMPDIR is None:
             _TMPDIR = tempfile.mkdtemp(prefix="browserpool-")
@@ -144,6 +241,7 @@ class Backend:
     def __init__(self, sid, slot=None):
         self.sid = sid
         self.slot = slot
+        self.window_state = "foreground" if not HEADLESS else "headless"
         self.lock = threading.Lock()
         self.last_used = time.time()
         self._id = itertools.count(1)
@@ -225,11 +323,33 @@ class Pool:
         self.backend_tools = None   # cached upstream schema list
 
     def ensure_schema(self):
-        """Boot one throwaway backend to read the upstream tool catalog."""
+        """Boot one throwaway backend to read the upstream tool catalog.
+
+        While it is up, and only if windows are visible, ask it how big the
+        screen actually is. A browser measuring its own display is the only
+        source that agrees with the coordinate space Chromium then positions
+        windows in - see os_screen() for why the OS is not asked first.
+        """
+        global _MEASURED_SCREEN
         if self.backend_tools is None:
             tmpl = Backend("schema")
             try:
                 self.backend_tools = tmpl.list_tools()
+                if TILE and not HEADLESS and not SCREEN_OVERRIDE:
+                    try:
+                        tmpl.call_tool("browser_navigate", {"url": "about:blank"},
+                                       timeout=60)
+                        r = tmpl.call_tool(
+                            "browser_evaluate",
+                            {"function": "() => screen.availWidth + 'x' + screen.availHeight"},
+                            timeout=60)
+                        txt = json.dumps(r.get("result", {}))
+                        m = re.search(r"(\d{3,5})\s*x\s*(\d{3,5})", txt)
+                        if m:
+                            _MEASURED_SCREEN = (int(m.group(1)), int(m.group(2)))
+                            log("measured screen: %dx%d" % _MEASURED_SCREEN)
+                    except Exception as e:
+                        log("screen measurement failed (%s); falling back" % e)
             finally:
                 tmpl.close()
         return self.backend_tools
@@ -304,9 +424,15 @@ class Pool:
                     "active": list(self.sessions.keys()),
                     "slots": {sid: be.slot for sid, be in self.sessions.items()
                               if be != "spawning"},
+                    "windows": {sid: be.window_state
+                                for sid, be in self.sessions.items()
+                                if be != "spawning"},
                     "free": MAX - len(self.sessions),
                     "headless": HEADLESS,
                     "tiling": TILE and not HEADLESS,
+                    "grid": "%dx%d of %dx%d" % (layout()[0], -(-MAX // layout()[0]),
+                                                layout()[1], layout()[2])
+                            if (TILE and not HEADLESS) else None,
                     "login_seed": os.path.exists(STATE),
                     "idle_timeout": IDLE_TIMEOUT,
                     "version": VERSION}
@@ -334,17 +460,44 @@ POOL_TOOLS = [
      "description": "Show pool status: max, active session ids, free slots, login seed state.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "browser_bring_to_front",
-     "description": ("Raise this session's window above the others and focus it "
-                     "(headed mode only; a no-op when the pool is headless). Use "
-                     "when a human needs to watch or take over a particular "
-                     "session."),
+     "description": ("Show this session's window to the human: restore it if "
+                     "minimised, raise it above the others and focus it. The "
+                     "SAME tab keeps running - nothing is reloaded and no state "
+                     "is lost. You do NOT need this to read or drive the page; "
+                     "use it only when a person should watch or take over. "
+                     "Pair with browser_send_to_back to return it to the "
+                     "background. No-op when the pool is headless."),
+     "inputSchema": {"type": "object",
+                     "properties": {"session": {"type": "string"}},
+                     "required": ["session"]}},
+    {"name": "browser_send_to_back",
+     "description": ("Put this session's window back in the background "
+                     "(minimised) without closing it. The tab stays live and "
+                     "every browser_* tool keeps working on it exactly as "
+                     "before - this only stops it covering the human's screen. "
+                     "No-op when the pool is headless."),
      "inputSchema": {"type": "object",
                      "properties": {"session": {"type": "string"}},
                      "required": ["session"]}},
 ]
 
-# page.bringToFront() has no upstream tool, so reach it through the raw page.
-BRING_TO_FRONT_JS = "async (page) => { await page.bringToFront(); return page.url(); }"
+# Neither raising nor minimising has an upstream tool, so both reach the real
+# window through the backend's raw `page`. Restore-then-raise is deliberate:
+# bringToFront() alone does not un-minimise a window.
+BRING_TO_FRONT_JS = """async (page) => {
+  const s = await page.context().newCDPSession(page);
+  const { windowId } = await s.send('Browser.getWindowForTarget');
+  await s.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+  await page.bringToFront();
+  return page.url();
+}"""
+
+SEND_TO_BACK_JS = """async (page) => {
+  const s = await page.context().newCDPSession(page);
+  const { windowId } = await s.send('Browser.getWindowForTarget');
+  await s.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+  return page.url();
+}"""
 
 
 def catalog():
@@ -380,23 +533,34 @@ def handle_call(name, args):
         return text_result("closed" if ok else "no such session")
     if name == "browser_list_sessions":
         return text_result(json.dumps(POOL.status()))
-    if name == "browser_bring_to_front":
+    if name in ("browser_bring_to_front", "browser_send_to_back"):
+        to_front = name == "browser_bring_to_front"
+        sid = args.get("session") or ""
+        if HEADLESS:
+            return text_result(
+                "no-op: the pool is headless, so there is no window to %s. The "
+                "tab is still fully usable - browser_snapshot and "
+                "browser_take_screenshot work regardless. For visible windows "
+                "set BROWSERPOOL_HEADLESS=0 and restart the server."
+                % ("raise" if to_front else "hide"))
         try:
-            be = POOL.get(args.get("session") or "")
+            be = POOL.get(sid)
         except KeyError:
             return text_result("error: unknown session %s; call browser_new_session"
-                               % args.get("session"), True)
-        resp = be.call_tool("browser_run_code_unsafe",
-                            {"code": BRING_TO_FRONT_JS}, timeout=60)
+                               % sid, True)
+        resp = be.call_tool(
+            "browser_run_code_unsafe",
+            {"code": BRING_TO_FRONT_JS if to_front else SEND_TO_BACK_JS},
+            timeout=60)
         if "error" in resp:
             return text_result(
-                "bring_to_front failed (needs the backend's run-code capability): "
-                + json.dumps(resp["error"]), True)
-        if HEADLESS:
-            return text_result("no-op: pool is headless, there is no window to "
-                               "raise. Set BROWSERPOOL_HEADLESS=0 and restart.")
-        return text_result("raised session %s (slot %s)"
-                           % (be.sid, be.slot if be.slot is not None else "-"))
+                "%s failed (needs the backend's run-code capability): %s"
+                % (name, json.dumps(resp["error"])), True)
+        be.window_state = "foreground" if to_front else "background"
+        return text_result(
+            "session %s is now in the %s (slot %s). The tab is unchanged and "
+            "still driveable." % (be.sid, be.window_state,
+                                  be.slot if be.slot is not None else "-"))
 
     # passthrough to a session's backend
     sid = args.pop("session", None)

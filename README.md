@@ -150,23 +150,25 @@ default.
 | `BROWSERPOOL_IDLE_TIMEOUT` | `3600` | seconds before an idle session is reaped; `0` disables |
 | `BROWSERPOOL_PACKAGE` | `@playwright/mcp@latest` | backend package spec |
 | `BROWSERPOOL_TILE` | `1` | tile headed windows into a grid; `0` stacks them |
-| `BROWSERPOOL_TILE_COLS` | `3` | tiled windows per row |
-| `BROWSERPOOL_WINDOW_SIZE` | `900x700` | tiled window size, `WxH` |
+| `BROWSERPOOL_TILE_COLS` | fit to screen | tiled windows per row |
+| `BROWSERPOOL_WINDOW_SIZE` | fit to screen | tiled window size, `WxH` |
+| `BROWSERPOOL_SCREEN` | measured | screen size to fit into, `WxH` |
 
 Env changes take effect when the client restarts the server - a running pool
 keeps the environment it started with.
 
 ## Tools
 
-Three pool tools, plus every upstream `@playwright/mcp` tool with a required
+Five pool tools, plus every upstream `@playwright/mcp` tool with a required
 `session` argument added and `[pool]` prefixed to its description.
 
 | Tool | Purpose |
 |---|---|
 | `browser_new_session` | allocate a browser, returns `sN` |
 | `browser_close_session` | release it, frees a slot |
-| `browser_list_sessions` | max, active ids, grid slots, free slots, whether a login seed is loaded |
-| `browser_bring_to_front` | raise one session's window above the rest (headed only) |
+| `browser_list_sessions` | max, active ids, grid slots, window states, free slots, login seed |
+| `browser_bring_to_front` | show one session's window to the human (headed only) |
+| `browser_send_to_back` | put that window back in the background, tab still live |
 
 Sessions are allocated on demand and closed on `browser_close_session`, on the
 idle timeout, or when the server exits. Requesting one past `MAX` is refused
@@ -183,19 +185,59 @@ pixels, `browser_evaluate` for pulling values straight out of the page. Headless
 is not blind - a screenshot is how you look at a headless session.
 
 **What a human sees** needs `BROWSERPOOL_HEADLESS=0`. Headed pools tile their
-windows into a grid by default, because the alternative is `MAX` windows stacked
-exactly on top of each other: `@playwright/mcp` accepts launch arguments only
-through `--config`, and every backend is handed the same one, so the pool
-generates a per-session config with its own `--window-position` instead. Slots
-are reused as sessions close, so windows do not wander off-screen. Set
-`BROWSERPOOL_TILE=0` to opt out.
+windows into a grid, because the alternative is `MAX` windows stacked exactly on
+top of each other: `@playwright/mcp` accepts launch arguments only through
+`--config`, and every backend is handed the same one, so the pool generates a
+per-session config with its own `--window-position` instead. Slots are reused as
+sessions close, so windows do not wander off-screen. `BROWSERPOOL_TILE=0` opts
+out.
 
-To pull one session's window to the front - to watch it, or to take over -
-`browser_bring_to_front(session)` raises and focuses it. Upstream has no tool
-for this; the pool reaches `page.bringToFront()` through the backend's
-run-code capability, so the agent does not have to invoke an RCE-equivalent
-tool by hand just to raise a window. It reports a no-op when the pool is
-headless.
+The grid **fits itself to your screen**. It picks the column count that fills the
+display best for `MAX` windows, scored by usable area but penalised for extreme
+aspect ratios - otherwise five 512x1504 slivers would win on raw area and be
+useless to look at. A 2560x1504 desktop with `MAX=5` becomes a 3x2 grid of
+853x752 windows; 1920x1080 becomes 3x2 of 640x540. Set `BROWSERPOOL_WINDOW_SIZE`
+or `BROWSERPOOL_TILE_COLS` to override either half of that.
+
+The screen size is **measured by asking a real browser** (`screen.availWidth`)
+at startup, not the OS. On a scaled Windows desktop the OS answers the process in
+logical pixels - 1280x800 - while Chromium, launched with
+`--force-device-scale-factor=1`, positions windows in physical pixels across
+2560x1600. Trusting the OS there crams the grid into the top-left quarter of the
+screen. `BROWSERPOOL_SCREEN=WxH` overrides the measurement.
+
+### Moving one session between background and foreground
+
+The same tab, without reloading it or losing any state:
+
+```
+browser_bring_to_front(session="s3")   # restore + raise + focus, for a human
+browser_send_to_back(session="s3")     # minimise it again, tab keeps running
+```
+
+Upstream has neither tool. `bring_to_front` reaches `page.bringToFront()` and
+`send_to_back` drives CDP `Browser.setWindowBounds`, both through the backend's
+run-code capability, so an agent never has to invoke an RCE-equivalent tool by
+hand just to move a window. Restore-then-raise is deliberate: `bringToFront()`
+alone does not un-minimise. Both report a no-op when the pool is headless, and
+`browser_list_sessions` reports every session's window state.
+
+### The recipe for agents
+
+Paste into `CLAUDE.md`, or any agent's instructions:
+
+> Browser work runs in the **background** by default - you do not need a visible
+> window to read or drive a page. Allocate with `browser_new_session`, then pass
+> `session="sN"` to every `browser_*` call. Read the page with `browser_snapshot`
+> (the only view whose refs `browser_click` can use) or `browser_evaluate`, and
+> use `browser_take_screenshot` to look at pixels. All of this works identically
+> whether the pool is headless or headed.
+>
+> Only when a person needs to watch or take over, call
+> `browser_bring_to_front(session)` - it raises that exact tab, unchanged - and
+> `browser_send_to_back(session)` when you are done, so the window stops covering
+> their screen. Never close and reopen a session just to change its visibility.
+> Release with `browser_close_session` when the task is finished.
 
 ## Caveats
 
