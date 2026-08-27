@@ -39,15 +39,21 @@ def default_profile_root():
 def build_servers(args):
     profile_root = args.profile_root or default_profile_root()
     pkg = args.package
+    env = {"BROWSERPOOL_MAX": str(args.max),
+           "BROWSERPOOL_HEADLESS": "0" if args.headed else "1"}
+    if args.no_tile:
+        env["BROWSERPOOL_TILE"] = "0"
+    if args.window_size:
+        env["BROWSERPOOL_WINDOW_SIZE"] = args.window_size
+    if args.tile_cols:
+        env["BROWSERPOOL_TILE_COLS"] = str(args.tile_cols)
+
     servers = {
         "browserpool": {
             "type": "stdio",
             "command": args.python,
             "args": [SERVER],
-            "env": {
-                "BROWSERPOOL_MAX": str(args.max),
-                "BROWSERPOOL_HEADLESS": "0" if args.headed else "1",
-            },
+            "env": env,
         }
     }
     if not args.no_fanout:
@@ -80,6 +86,12 @@ def main():
     ap.add_argument("--max", type=int, default=5, help="pool size (default 5)")
     ap.add_argument("--headed", action="store_true",
                     help="pool browsers visible instead of headless")
+    ap.add_argument("--window-size", default=None, metavar="WxH",
+                    help="tiled window size for headed pools (default 900x700)")
+    ap.add_argument("--tile-cols", type=int, default=None,
+                    help="tiled windows per row for headed pools (default 3)")
+    ap.add_argument("--no-tile", action="store_true",
+                    help="stack headed windows instead of tiling them")
     ap.add_argument("--no-fanout", action="store_true",
                     help="install the pool only, skip playwright/-2/-3")
     ap.add_argument("--profile-root", default=None,

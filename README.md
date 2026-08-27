@@ -149,6 +149,9 @@ default.
 | `BROWSERPOOL_CONFIG` | `./config/playwright-mcp.json` | `--config` passed to backends |
 | `BROWSERPOOL_IDLE_TIMEOUT` | `3600` | seconds before an idle session is reaped; `0` disables |
 | `BROWSERPOOL_PACKAGE` | `@playwright/mcp@latest` | backend package spec |
+| `BROWSERPOOL_TILE` | `1` | tile headed windows into a grid; `0` stacks them |
+| `BROWSERPOOL_TILE_COLS` | `3` | tiled windows per row |
+| `BROWSERPOOL_WINDOW_SIZE` | `900x700` | tiled window size, `WxH` |
 
 Env changes take effect when the client restarts the server - a running pool
 keeps the environment it started with.
@@ -162,11 +165,37 @@ Three pool tools, plus every upstream `@playwright/mcp` tool with a required
 |---|---|
 | `browser_new_session` | allocate a browser, returns `sN` |
 | `browser_close_session` | release it, frees a slot |
-| `browser_list_sessions` | max, active ids, free slots, whether a login seed is loaded |
+| `browser_list_sessions` | max, active ids, grid slots, free slots, whether a login seed is loaded |
+| `browser_bring_to_front` | raise one session's window above the rest (headed only) |
 
 Sessions are allocated on demand and closed on `browser_close_session`, on the
 idle timeout, or when the server exits. Requesting one past `MAX` is refused
 with a message rather than queued.
+
+## Watching what the browsers are doing
+
+Two separate things get called "seeing the tab".
+
+**What the agent sees** is the same whether the pool is headless or headed, and
+needs no visible window: `browser_snapshot` (the accessibility tree, and the
+only view whose refs `browser_click` can act on), `browser_take_screenshot` for
+pixels, `browser_evaluate` for pulling values straight out of the page. Headless
+is not blind - a screenshot is how you look at a headless session.
+
+**What a human sees** needs `BROWSERPOOL_HEADLESS=0`. Headed pools tile their
+windows into a grid by default, because the alternative is `MAX` windows stacked
+exactly on top of each other: `@playwright/mcp` accepts launch arguments only
+through `--config`, and every backend is handed the same one, so the pool
+generates a per-session config with its own `--window-position` instead. Slots
+are reused as sessions close, so windows do not wander off-screen. Set
+`BROWSERPOOL_TILE=0` to opt out.
+
+To pull one session's window to the front - to watch it, or to take over -
+`browser_bring_to_front(session)` raises and focuses it. Upstream has no tool
+for this; the pool reaches `page.bringToFront()` through the backend's
+run-code capability, so the agent does not have to invoke an RCE-equivalent
+tool by hand just to raise a window. It reports a no-op when the pool is
+headless.
 
 ## Caveats
 
