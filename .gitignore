@@ -1,0 +1,18 @@
+# Login seed and its backups - cookies, never commit these
+state.json
+state.json.bak
+*.bak
+*.bak.*
+
+# Local machine paths
+config/paths.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Browser profiles, if anyone clones one in-tree
+*-profile/
+*-profile-*/
